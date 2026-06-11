@@ -8,9 +8,15 @@
 
 This fork adds **Huawei Ascend NPU** support to DFlash, enabling high-performance speculative decoding on Ascend 910B NPUs:
 
-- ✅ **Device Abstraction Layer**: Seamless CUDA/NPU compatibility
-- ✅ **NPU-Specific Optimizations**: Multinomial fallback, cumprod conversion, explicit attention masks
-- ✅ **Performance**: Achieved **1.92-2.33x speedup** on Qwen3-8B with Ascend 910B
+- ✅ **Unified Architecture**: Single codebase with device-specific branches (CUDA/NPU)
+- ✅ **Device Abstraction Layer**: Seamless CUDA/NPU compatibility via `device.py`
+- ✅ **NPU-Specific Optimizations**: 
+  - Multinomial CPU fallback for unsupported operations
+  - Bool-to-float conversion for cumprod
+  - Explicit attention masks for non-causal SDPA
+  - Dtype alignment for RMSNorm compatibility
+- ✅ **Performance Optimization**: Cached device type checks, eliminated redundant imports
+- ✅ **Performance**: Achieved **1.83-2.17x speedup** on Qwen3-8B with Ascend 910B
 - ✅ **Comprehensive Testing**: Full test suite for NPU validation
 
 ---

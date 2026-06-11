@@ -20,6 +20,13 @@ from transformers import DynamicCache
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.cache_utils import Cache
 
+# Import device utilities and cache device type at module level
+from .device import get_device_type, synchronize as _device_synchronize
+
+# Cache device type to avoid repeated checks
+_DEVICE_TYPE = get_device_type()
+_IS_NPU = _DEVICE_TYPE == "npu"
+
 # ---------------------------------------------------------------------------
 # Model utilities
 # ---------------------------------------------------------------------------
@@ -46,16 +53,31 @@ def extract_context_feature(
 
 
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
+    """Sample from logits with temperature scaling.
+
+    For NPU devices, falls back to CPU sampling if multinomial is not supported.
+    """
     if temperature < 1e-5:
         return torch.argmax(logits, dim=-1)
     bsz, seq_len, vocab_size = logits.shape
     logits = logits.view(-1, vocab_size) / temperature
     probs = torch.softmax(logits, dim=-1)
-    return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
+
+    # NPU may not support multinomial, fall back to CPU
+    if _IS_NPU:
+        try:
+            sampled = torch.multinomial(probs, num_samples=1)
+        except (RuntimeError, NotImplementedError):
+            sampled = torch.multinomial(probs.cpu(), num_samples=1).to(logits.device)
+    else:
+        sampled = torch.multinomial(probs, num_samples=1)
+
+    return sampled.view(bsz, seq_len)
 
 
-def _cuda_time() -> float:
-    torch.cuda.synchronize()
+def _sync_time() -> float:
+    """Device-agnostic synchronization and timing."""
+    _device_synchronize()
     return time.perf_counter()
 
 
@@ -83,7 +105,7 @@ def dflash_generate(
     past_key_values_target = DynamicCache()
     past_key_values_draft = DynamicCache()
 
-    prefill_start = _cuda_time() if return_stats else None
+    prefill_start = _sync_time() if return_stats else None
     output = target(
         input_ids,
         position_ids=position_ids[:, :num_input_tokens],
@@ -97,9 +119,9 @@ def dflash_generate(
     output_ids[:, num_input_tokens:num_input_tokens + 1] = sample(output.logits, temperature)
     if block_size > 1:
         target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)
-    time_to_first_token = _cuda_time() - prefill_start if return_stats else None
+    time_to_first_token = _sync_time() - prefill_start if return_stats else None
 
-    decode_start = _cuda_time() if return_stats else None
+    decode_start = _sync_time() if return_stats else None
     acceptance_lengths = []
     start = num_input_tokens
     draft_prefill = True
@@ -121,7 +143,7 @@ def dflash_generate(
             block_output_ids[:, 1:] = sample(draft_logits)
             if draft_prefill and return_stats:
                 draft_prefill = False
-                decode_start = _cuda_time()
+                decode_start = _sync_time()
 
         output = target(
             block_output_ids,
@@ -132,7 +154,11 @@ def dflash_generate(
         )
 
         posterior = sample(output.logits, temperature)
-        acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
+        # NPU does not support cumprod on bool tensors, convert to float
+        match = (block_output_ids[:, 1:] == posterior[:, :-1])
+        if _IS_NPU:
+            match = match.float()
+        acceptance_length = int(match.cumprod(dim=1).sum(dim=1)[0].item())
         output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
         output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
         start += acceptance_length + 1
@@ -158,7 +184,7 @@ def dflash_generate(
         return output_ids
 
     num_output_tokens = output_ids.shape[1] - num_input_tokens
-    total_decode_time = _cuda_time() - decode_start
+    total_decode_time = _sync_time() - decode_start
     return SimpleNamespace(
         output_ids=output_ids,
         num_input_tokens=num_input_tokens,
@@ -192,6 +218,8 @@ class Qwen3DFlashAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = False
+        # Cache device type to avoid repeated checks in forward pass
+        self._is_npu = _IS_NPU
         self.q_proj = nn.Linear(
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
         )
@@ -231,11 +259,26 @@ class Qwen3DFlashAttention(nn.Module):
         v = torch.cat([v_ctx, v_noise], dim=1).view(bsz, ctx_len + q_len, -1, self.head_dim)
         k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
+
+        # NPU: Ensure v has the same dtype as q (RMSNorm may change dtype)
+        if self._is_npu:
+            v = v.to(dtype=q.dtype)
+
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+
+        # NPU: Construct explicit mask for non-causal attention (SDPA requires it)
+        if self._is_npu and attention_mask is None and not self.is_causal:
+            bsz = q.size(0)
+            q_len = q.size(-2)
+            kv_len = k.size(-2)
+            attention_mask = torch.zeros(
+                bsz, 1, q_len, kv_len, dtype=q.dtype, device=q.device,
+            )
+
         attn_fn: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]

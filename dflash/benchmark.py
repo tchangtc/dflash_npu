@@ -209,11 +209,7 @@ def _run_transformers(args: argparse.Namespace) -> None:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     from .device import manual_seed_all, set_device, get_device, get_device_type
-    # 根据设备类型选择导入 CUDA 或 NPU 版本
-    if get_device_type() == "npu":
-        from .model_npu import DFlashDraftModel, dflash_generate
-    else:
-        from .model import DFlashDraftModel, dflash_generate
+    from .model import DFlashDraftModel, dflash_generate
 
     _check_transformers_model(args.model)
 

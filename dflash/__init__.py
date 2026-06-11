@@ -19,13 +19,8 @@ def __getattr__(name):
         return load_and_process_dataset
 
     if name in {"DFlashDraftModel", "extract_context_feature", "sample"}:
-        # 根据设备类型选择导入 CUDA 或 NPU 版本
-        from .device import get_device_type
-        if get_device_type() == "npu":
-            from .model_npu import DFlashDraftModel, sample
-            from .model import extract_context_feature
-        else:
-            from .model import DFlashDraftModel, extract_context_feature, sample
+        # All implementations are now in model.py with device-specific branches
+        from .model import DFlashDraftModel, extract_context_feature, sample
 
         return {
             "DFlashDraftModel": DFlashDraftModel,
